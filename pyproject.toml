@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-ps"
+version = "0.1.0"
+description = "ps + du + env audit for coding agents: daemons, leaked tokens, stale sessions, old versions"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+keywords = ["claude-code", "codex", "coding-agents", "daemon", "devtools", "security"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/thinx-pro/agent-ps"
+
+[project.scripts]
+agent-ps = "agent_ps.cli:main"
+
+[tool.setuptools]
+packages = ["agent_ps"]
