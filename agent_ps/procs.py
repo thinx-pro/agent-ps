@@ -108,17 +108,17 @@ def parse_etime(s):
 
 
 def _ps_rows():
-    out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,etime=,rss=,time=,tty=,args="],
+    out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,etime=,rss=,time=,stat=,tty=,args="],
                          capture_output=True, text=True).stdout
     rows = []
     for line in out.splitlines():
-        f = line.split(None, 6)
-        if len(f) < 7:
+        f = line.split(None, 7)
+        if len(f) < 8:
             continue
         try:
             rows.append({"pid": int(f[0]), "ppid": int(f[1]), "age": parse_etime(f[2]),
                          "rss_kb": int(f[3]), "cpu": parse_etime(f[4].split(".")[0]),
-                         "tty": f[5], "args": f[6]})
+                         "stat": f[5], "tty": f[6], "args": f[7]})
         except ValueError:
             continue
     return rows
@@ -208,6 +208,104 @@ def read_cwd(pid):
         if line.startswith("n"):
             return line[1:]
     return None
+
+
+MCP_RX = re.compile(r"mcp|modelcontextprotocol|language-?server|\blsp\b|tsserver|pyright|gopls|rust-analyzer", re.I)
+WRAPPER_RX = re.compile(r"^(/bin/|/usr/bin/)?(ba|z|da|k)?sh$|/(ba|z)sh$")
+TOOLING_RX = re.compile(r"(^|/)(caffeinate|ripgrep|rg|fsevents|git-credential|ssh-agent)$")
+
+
+def children_map(rows):
+    kids = {}
+    for r in rows:
+        kids.setdefault(r["ppid"], []).append(r)
+    return kids
+
+
+def subtree(pid, kids):
+    out, stack = [], list(kids.get(pid, []))
+    while stack:
+        r = stack.pop()
+        out.append(r)
+        stack.extend(kids.get(r["pid"], []))
+    return out
+
+
+_INLINE_SECRET = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|"
+    r"AIza[0-9A-Za-z_-]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{30,}|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*)")
+_ASSIGN_SECRET = re.compile(r"\b([A-Za-z_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY)[A-Za-z_]*=)"
+                            r"(?!\$\()(\"[^\"]*\"|'[^']*'|\S+)", re.I)
+_FLAG_SECRET = re.compile(r"(--?(?:token|password|passwd|api[-_]?key|secret|auth)(?:=|\s+))(\"[^\"]*\"|'[^']*'|\S+)", re.I)
+
+
+def redact(cmd):
+    """Mask credential-looking values in a command line (the command column must never leak a token)."""
+    cmd = _INLINE_SECRET.sub("***", cmd)
+    cmd = _ASSIGN_SECRET.sub(lambda m: m.group(1) + "***", cmd)
+    return _FLAG_SECRET.sub(lambda m: m.group(1) + "***", cmd)
+
+
+APP_HELPER_RX = re.compile(r"\.app/Contents/(Resources|Frameworks|MacOS)/")
+
+
+def describe(root_args):
+    """What the agent actually launched. Unwraps `sh -c '...'` and the `... && eval '<cmd>'` wrapper
+    Claude Code's Bash tool uses."""
+    a = root_args or ""
+    first = a.split()[0] if a.split() else ""
+    if WRAPPER_RX.search(first) and " -c " in f" {a} ":
+        a = a.split(" -c", 1)[1].lstrip()
+        if a.startswith("-l "):
+            a = a[3:]
+        m = re.search(r"\beval\s+(['\"])(.*)\1", a, re.S)
+        if m:
+            a = m.group(2)
+        elif len(a) > 1 and a[0] == a[-1] and a[0] in "'\"":
+            a = a[1:-1]
+        a = re.sub(r"\s*<\s*/dev/null\s*$", "", a)
+    return " ".join(a.split())
+
+
+def agent_trees(procs, rows=None):
+    """Non-agent process trees started by agent processes (Bash-tool commands, test runners, dev servers, loops).
+
+    Returns one dict per direct child of an agent process: root pid, agent pid/kind, age of the
+    tree root, total CPU seconds, process count, the most telling command, and a category.
+    """
+    rows = rows if rows is not None else _ps_rows()
+    kids = children_map(rows)
+    agent_pids = {p["pid"] for p in procs}
+    trees = []
+    for ap in procs:
+        for child in kids.get(ap["pid"], []):
+            if child["pid"] in agent_pids:
+                continue
+            tree = [child] + subtree(child["pid"], kids)
+            tree = [r for r in tree if r["pid"] not in agent_pids]
+            if not tree or any(r["pid"] == os.getpid() for r in tree):
+                continue  # nothing left, or it is agent-ps itself
+            joined = " ".join(r["args"] for r in tree)
+            first = child["args"].split()[0] if child["args"].split() else ""
+            if child["args"].strip() in ("<defunct>", "") or child.get("stat", "").startswith("Z"):
+                cat = "zombie"
+            elif APP_HELPER_RX.search(first):
+                cat = "app-helper"
+            elif MCP_RX.search(joined):
+                cat = "mcp/lsp"
+            elif all(TOOLING_RX.search(r["args"].split()[0]) for r in tree if r["args"]):
+                cat = "tooling"
+            else:
+                cat = "command"
+            cpu = sum(r["cpu"] for r in tree)
+            trees.append({"root_pid": child["pid"], "agent": ap["agent"], "agent_pid": ap["pid"],
+                          "agent_kind": ap["kind"], "age": child["age"], "cpu": cpu, "count": len(tree),
+                          "rss_kb": sum(r["rss_kb"] for r in tree), "command": redact(describe(child["args"]))[:200],
+                          "pids": [r["pid"] for r in tree], "category": cat,
+                          "paused": all(r.get("stat", "").startswith("T") for r in tree),
+                          "busy": cpu / max(child["age"], 1)})
+    return trees
 
 
 def scan(with_cwd=False):

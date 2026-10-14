@@ -41,6 +41,10 @@ def human_bytes(n):
         n /= 1024.0
 
 
+def human_cpu(sec):
+    return f"{sec}s" if sec < 60 else human_age(sec)
+
+
 def human_age(sec):
     if sec >= 86400:
         return f"{sec // 86400}d{(sec % 86400) // 3600}h"
@@ -213,8 +217,98 @@ def cmd_prune(args):
     return 0
 
 
-def findings(ps, inst, stale_h):
+def runaways(ps, minutes, include_mcp=False, rows=None):
+    trees = P.agent_trees(ps, rows)
+    hidden = {"tooling", "zombie", "app-helper"} | (set() if include_mcp else {"mcp/lsp"})
+    keep = [t for t in trees if t["age"] >= minutes * 60 and t["category"] not in hidden]
+    return sorted(keep, key=lambda t: -t["age"])
+
+
+def _signal_trees(trees, pids, sig, verb):
+    import signal as S
+    sigs = {"pause": S.SIGSTOP, "resume": S.SIGCONT, "kill": S.SIGTERM}
+    by_root = {t["root_pid"]: t for t in trees}
+    done = []
+    for pid in pids:
+        t = by_root.get(pid)
+        if not t:
+            print(C.s(f"pid {pid} is not the root of an agent-started process tree; skipped", "yel"), file=sys.stderr)
+            continue
+        ok = 0
+        # leaves first, so a parent never sees its child vanish mid-signal
+        for p in reversed(t["pids"]):
+            try:
+                os.kill(p, sigs[sig])
+                ok += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+        done.append((pid, ok, len(t["pids"])))
+        print(f"{verb} tree {pid}: {ok}/{len(t['pids'])} process(es) signalled")
+    return done
+
+
+def cmd_runaway(args):
+    import time
+    seen = set()
+    while True:
+        ps = P.scan()
+        trees_all = P.agent_trees(ps)
+        acts = [("pause", args.pause, "paused"), ("resume", args.resume, "resumed"), ("kill", args.kill, "terminated")]
+        if any(pids for _, pids, _ in acts):
+            if not args.yes:
+                print("Refusing to signal processes without --yes. Pause is SIGSTOP (undo: --resume), kill is SIGTERM.",
+                      file=sys.stderr)
+                return 2
+            for sig, pids, verb in acts:
+                if pids:
+                    _signal_trees(trees_all, pids, sig, verb)
+            return 0
+        found = runaways(ps, args.minutes, args.include_mcp)
+        if args.json and not args.watch:
+            return _dump({"minutes": args.minutes, "runaways": found})
+        new = [t for t in found if t["root_pid"] not in seen]
+        if not args.watch:
+            _print_runaways(found, args.minutes)
+        elif new:
+            stamp = time.strftime("%H:%M:%S")
+            for t in new:
+                print(f"{stamp}  " + C.s("runaway", "yel", "b") + f" {t['agent']} {t['agent_pid']} → tree {t['root_pid']} "
+                      f"up {human_age(t['age'])}, cpu {human_age(t['cpu'])}: {t['command'][:90]}", flush=True)
+                if args.auto_pause and not t["paused"]:
+                    _signal_trees(found, [t["root_pid"]], "pause", f"{stamp}  auto-paused")
+            seen.update(t["root_pid"] for t in new)
+        if not args.watch:
+            return 1 if (args.strict and found) else 0
+        time.sleep(args.watch)
+
+
+def _print_runaways(found, minutes):
+    if not found:
+        print(C.s(f"✓ no agent-started process trees older than {minutes:g} min", "grn"))
+        return
+    rows = []
+    for t in found:
+        state = C.s("paused", "cyan") if t["paused"] else (C.s("busy", "red", "b") if t["busy"] > 0.2 else C.s("running", "dim"))
+        cmd = t["command"]
+        cmd = tilde(cmd.replace(HOME, "~"))
+        rows.append([str(t["root_pid"]), f"{t['agent']} {t['agent_pid']}", human_age(t["age"]), human_cpu(t["cpu"]),
+                     str(t["count"]), human_bytes(t["rss_kb"] * 1024), state, cmd[:70]])
+    print(table(["TREE", "STARTED BY", "AGE", "CPU", "PROCS", "RSS", "STATE", "COMMAND"], rows,
+                [">", "<", ">", ">", ">", ">", "<", "<"]))
+    print(C.s(f"\n{len(found)} process tree(s) started by agents and running ≥ {minutes:g} min "
+              "(MCP/LSP servers, app helpers and zombies hidden; --include-mcp)", "dim"))
+    print(C.s("pause:  agent-ps runaway --pause TREE --yes    (SIGSTOP the whole tree; undo with --resume TREE --yes)", "dim"))
+
+
+def findings(ps, inst, stale_h, runaway_trees=None, runaway_min=60):
     out = []
+    ra = runaway_trees or []
+    if ra:
+        desc = "; ".join(f"tree {t['root_pid']} from {t['agent']} {t['agent_pid']}, up {human_age(t['age'])}: "
+                         f"{t['command'][:60].replace(HOME, '~')}" for t in ra[:5])
+        out.append(("warn", f"{len(ra)} process tree(s) started by an agent have been running ≥ {runaway_min} min: {desc}",
+                    "Background test loops and dev servers keep running (and calling paid APIs) after the agent "
+                    "has moved on or reports itself idle.", "agent-ps runaway"))
     bg_secret = [p for p in ps if p["kind"] in BACKGROUND and p["secrets"]]
     if bg_secret:
         names = sorted({n for p in bg_secret for n in p["secrets"]})
@@ -261,7 +355,7 @@ def findings(ps, inst, stale_h):
 
 def cmd_doctor(args):
     ps, inst = collect(args, with_cwd=True)
-    fs = findings(ps, inst, args.stale)
+    fs = findings(ps, inst, args.stale, runaways(ps, 60))
     if args.json:
         return _dump({"findings": [{"level": l, "message": m, "advice": a, "commands": c} for l, m, a, c in fs],
                       "processes": ps, "installs": inst})
@@ -321,6 +415,17 @@ def main(argv=None):
     d.add_argument("--strict", action="store_true", help="exit 1 if there are warnings")
     pr = sub.add_parser("prune", parents=[common], help="delete old versions nobody runs (dry run unless --yes)")
     pr.add_argument("--yes", action="store_true", help="actually delete")
+    ra = sub.add_parser("runaway", parents=[common],
+                        help="long-running process trees started by agents (test loops, dev servers); pause / resume / kill")
+    ra.add_argument("--minutes", type=float, default=30, help="report trees running at least this long (default 30)")
+    ra.add_argument("--include-mcp", action="store_true", help="also list MCP / language servers")
+    ra.add_argument("--pause", type=int, nargs="+", metavar="TREE", help="SIGSTOP every process in these trees")
+    ra.add_argument("--resume", type=int, nargs="+", metavar="TREE", help="SIGCONT every process in these trees")
+    ra.add_argument("--kill", type=int, nargs="+", metavar="TREE", help="SIGTERM every process in these trees")
+    ra.add_argument("--yes", action="store_true", help="required for --pause / --resume / --kill")
+    ra.add_argument("--watch", type=float, metavar="SECONDS", help="re-check every SECONDS and print new runaways")
+    ra.add_argument("--auto-pause", action="store_true", help="with --watch: SIGSTOP each new runaway tree")
+    ra.add_argument("--strict", action="store_true", help="exit 1 if any runaway is found")
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version"):
         argv = ["ps"] + list(argv)
@@ -328,7 +433,8 @@ def main(argv=None):
     C.on = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
     if os.environ.get("FORCE_COLOR") and not args.no_color:
         C.on = True
-    return {"ps": cmd_ps, "env": cmd_env, "disk": cmd_disk, "doctor": cmd_doctor, "prune": cmd_prune}[args.cmd](args)
+    return {"ps": cmd_ps, "env": cmd_env, "disk": cmd_disk, "doctor": cmd_doctor, "prune": cmd_prune,
+            "runaway": cmd_runaway}[args.cmd](args)
 
 
 if __name__ == "__main__":

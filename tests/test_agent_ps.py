@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent_ps import cli, installs, procs  # noqa: E402
+P = procs
 
 
 class ParseTests(unittest.TestCase):
@@ -184,6 +185,76 @@ class FindingTests(unittest.TestCase):
         self.assertIn("2× Claude Code (native) 2.1.10 (current 2.1.11)", msgs)
 
 
+class RunawayTests(unittest.TestCase):
+    def row(self, pid, ppid, args, age=7200, cpu=0, stat="S"):
+        return {"pid": pid, "ppid": ppid, "age": age, "rss_kb": 100, "cpu": cpu, "stat": stat, "tty": "??", "args": args}
+
+    def setUp(self):
+        self.agent = {"pid": 1000, "agent": "claude", "kind": "session"}
+        self.rows = [
+            self.row(1000, 900, "claude"),
+            self.row(1001, 1000, "/bin/zsh -c -l source /x/snap.sh && eval 'npm run dev' < /dev/null"),
+            self.row(1002, 1001, "node next-server", cpu=100),
+            self.row(1003, 1000, "npx -y @modelcontextprotocol/server-filesystem /tmp"),
+            self.row(1004, 1000, "/Applications/X.app/Contents/Resources/node helper.js"),
+            self.row(1005, 1000, "<defunct>", stat="Z"),
+            self.row(1006, 1000, "bash -c 'while true; do pytest; done'", age=120, cpu=90, stat="T"),
+        ]
+
+    def test_trees_and_categories(self):
+        trees = {t["root_pid"]: t for t in P.agent_trees([self.agent], self.rows)}
+        self.assertEqual(trees[1001]["command"], "npm run dev")
+        self.assertEqual(trees[1001]["count"], 2)
+        self.assertEqual(trees[1001]["category"], "command")
+        self.assertEqual(trees[1003]["category"], "mcp/lsp")
+        self.assertEqual(trees[1004]["category"], "app-helper")
+        self.assertEqual(trees[1005]["category"], "zombie")
+        self.assertEqual(trees[1006]["command"], "while true; do pytest; done")
+        self.assertTrue(trees[1006]["paused"])
+
+    def test_runaway_filter(self):
+        rows = self.rows
+        found = cli.runaways([self.agent], 30, rows=rows)
+        self.assertEqual([t["root_pid"] for t in found], [1001])  # 1006 too young, rest hidden
+        self.assertEqual(len(cli.runaways([self.agent], 1, include_mcp=True, rows=rows)), 3)
+
+    def test_redact(self):
+        tok = "ghp_" + "A" * 36
+        self.assertNotIn(tok, P.redact(f"curl -H 'x: {tok}' url"))
+        self.assertEqual(P.redact("API_KEY=abc123 node x.js"), "API_KEY=*** node x.js")
+        self.assertEqual(P.redact("export GH_TOKEN=$(gh auth token)"), "export GH_TOKEN=$(gh auth token)")
+        self.assertEqual(P.redact("tool --token s3cret run"), "tool --token *** run")
+
+    def test_doctor_finding(self):
+        trees = cli.runaways([self.agent], 60, rows=self.rows)
+        fs = cli.findings([], [], 24, trees)
+        self.assertEqual(fs[0][0], "warn")
+        self.assertIn("npm run dev", fs[0][1])
+
+    def test_watch_auto_pause_once(self):
+        from unittest import mock
+        trees = P.agent_trees([self.agent], self.rows)
+        sent = []
+
+        class Stop(Exception):
+            pass
+
+        with mock.patch.object(P, "scan", return_value=[self.agent]), \
+                mock.patch.object(P, "agent_trees", return_value=trees), \
+                mock.patch("os.kill", side_effect=lambda pid, sig: sent.append(pid)), \
+                mock.patch("time.sleep", side_effect=[None, Stop()]):
+            buf = io.StringIO()
+            with redirect_stdout(buf), self.assertRaises(Stop):
+                cli.main(["runaway", "--watch", "1", "--auto-pause", "--no-color"])
+        out = buf.getvalue()
+        self.assertEqual(out.count("runaway claude 1000 → tree 1001"), 1)  # reported once across two scans
+        self.assertEqual(sorted(sent), [1001, 1002])
+
+    def test_signal_needs_yes(self):
+        code = cli.main(["runaway", "--pause", "999999"])
+        self.assertEqual(code, 2)
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, *argv):
         buf = io.StringIO()
@@ -192,7 +263,7 @@ class CliTests(unittest.TestCase):
         return code, buf.getvalue()
 
     def test_commands_run(self):
-        for cmd in (["ps"], ["--all"], ["env"], ["disk"], ["doctor"], ["prune"]):
+        for cmd in (["ps"], ["--all"], ["env"], ["disk"], ["doctor"], ["prune"], ["runaway"]):
             code, out = self.run_cli(*cmd, "--no-color")
             self.assertEqual(code, 0, cmd)
             self.assertTrue(out.strip(), cmd)

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ps"
-version = "0.1.0"
-description = "ps + du + env audit for coding agents: daemons, leaked tokens, stale sessions, old versions"
+version = "0.2.0"
+description = "ps + du + env audit for coding agents: daemons, leaked tokens, stale sessions, old versions, runaway background jobs"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
