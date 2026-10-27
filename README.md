@@ -115,9 +115,3 @@ python3 -m agent_ps doctor
 ## License
 
 MIT
-
----
-
-### 中文说明
-
-agent-ps 是给编码 Agent 用的 `ps` + `du` + 环境变量体检工具。一条命令列出本机 Claude Code、Codex、Cursor Agent、Gemini CLI 等的进程，区分会话、守护进程、更新器和桌面端子进程，并显示版本、存活时间和内存。它会标出后台进程从启动它的那个会话继承来的 TOKEN / KEY 类环境变量，只显示变量名，绝不输出值。它还会统计各 Agent 按版本保留的安装目录，找出没人在用、可以回收的旧版本，`prune` 默认只预演，加 `--yes` 才删除。作者自己的 Mac 上实测：Codex 更新器常驻 6 天，带着两个令牌变量；旧版本可回收 1.4 GB。0.2.0 新增 `agent-ps runaway`：列出由 Agent 拉起、运行超过 N 分钟仍未结束的进程树，例如后台测试循环、dev server、监视器，并显示真实启动的命令（凭据类值会打码）。可以 `--pause`（SIGSTOP，可 `--resume` 恢复）或 `--kill`，`--watch --auto-pause` 适合夜间无人值守。作者机器上实测发现一个 4 天前由 Claude Code 启动、至今仍在运行的 `npm run dev`。零依赖，Python 3.8+：`pipx run --spec git+https://github.com/thinx-pro/agent-ps agent-ps doctor`。
