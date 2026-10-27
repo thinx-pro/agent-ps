@@ -2,6 +2,9 @@
 
 **`ps` + `du` + env audit for the coding agents on your machine.** See which Claude Code / Codex / Cursor Agent / Gemini CLI processes are running, which ones became background daemons, which tokens they inherited, how many gigabytes of old agent versions nobody runs anymore, and which background jobs they started and never stopped.
 
+<!-- agent-preflight -->
+> **Also a Claude Code skill.** `agent-ps` is part of [agent-preflight](https://github.com/thinx-pro/agent-preflight), 16 offline checks for coding agents: `/plugin marketplace add thinx-pro/agent-preflight` then `/plugin install agent-ps@agent-preflight`, and ask Claude in plain words.
+
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue) ![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen) ![macOS | Linux](https://img.shields.io/badge/os-macOS%20%7C%20Linux-lightgrey) ![MIT](https://img.shields.io/badge/license-MIT-green)
 
 ![agent-ps doctor on a real machine](assets/doctor.png)
